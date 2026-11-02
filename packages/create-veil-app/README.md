@@ -21,10 +21,10 @@ npx create-veil-wallet my-app --template=vanilla  # Vanilla JS, no framework
 Each command:
 
 1. Fetches the chosen template from [`examples/`](../../examples) in the
-   Veil repo.
-2. Vendors the [`sdk/`](../../sdk) package alongside it (the Stellar +
-   WebAuthn SDK isn't published to npm yet, so it's fetched and built
-   locally instead of installed from the registry).
+   Veil repo, pinned to the release tag matching the package version
+   (`v<version>`).
+2. Vendors the [`sdk/`](../../sdk) package alongside it at the same pinned
+   release tag.
 3. Builds the SDK and installs the app's dependencies.
 
 When it finishes, `cd my-app` and follow the printed next step (`npm run
@@ -44,12 +44,14 @@ This package isn't published yet. To run it from a checkout of this repo:
 cd packages/create-veil-app
 npm install
 npm run build
-node dist/index.js my-app --template=vite
+VEIL_TEMPLATE_REF=main node dist/index.js my-app --template=vite
 ```
 
-Set `VEIL_TEMPLATE_REPO` to point at a different GitHub `owner/repo` (e.g.
-your own fork) if you're testing template changes before they're merged:
+Set `VEIL_TEMPLATE_REF` (or pass `--ref=<branch-or-tag>`) to override the
+pinned release tag when testing unreleased template changes, and set
+`VEIL_TEMPLATE_REPO` to point at a different GitHub `owner/repo` (e.g. your
+own fork):
 
 ```bash
-VEIL_TEMPLATE_REPO=your-username/veil node dist/index.js my-app --template=vite
+VEIL_TEMPLATE_REPO=your-username/veil VEIL_TEMPLATE_REF=my-branch node dist/index.js my-app --template=vite
 ```

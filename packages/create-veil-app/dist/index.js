@@ -2,16 +2,89 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import degit from 'degit';
 import prompts from 'prompts';
-const REPO = process.env.VEIL_TEMPLATE_REPO ?? 'Miracle656/veil';
-const TEMPLATES = {
+export const DEFAULT_TEMPLATE_REPO = 'Miracle656/veil';
+const MOVING_TARGET_REFS = new Set(['latest', 'stable', 'main', 'master', 'head', 'next', 'dev', 'trunk']);
+export const TEMPLATES = {
     next: { label: 'Next.js', dir: 'examples/nextjs' },
     vite: { label: 'Vite + React', dir: 'examples/vite-react' },
     vanilla: { label: 'Vanilla JS', dir: 'examples/vanilla' },
 };
-function isTemplateKey(value) {
+export function isTemplateKey(value) {
     return value in TEMPLATES;
+}
+export function getPackageVersion(pkgJsonPath = fileURLToPath(new URL('../package.json', import.meta.url))) {
+    const raw = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+    const version = typeof raw.version === 'string' ? raw.version.trim() : '';
+    if (!version) {
+        throw new Error(`Could not determine package version from ${pkgJsonPath}`);
+    }
+    return version;
+}
+export function getPinnedTemplateTag(version = getPackageVersion()) {
+    const cleaned = version.trim().replace(/^v/, '');
+    if (!cleaned || MOVING_TARGET_REFS.has(cleaned.toLowerCase()) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(cleaned)) {
+        throw new Error(`Invalid pinned template version "${version}". Default template pin must resolve to an immutable semver release tag.`);
+    }
+    return `v${cleaned}`;
+}
+export function resolveTemplateSource(env = process.env, cliRef, version) {
+    const pinnedTag = getPinnedTemplateTag(version);
+    const rawRepoEnv = env.VEIL_TEMPLATE_REPO?.trim();
+    let repo = DEFAULT_TEMPLATE_REPO;
+    let inlineRef;
+    if (rawRepoEnv) {
+        const hashIndex = rawRepoEnv.indexOf('#');
+        if (hashIndex !== -1) {
+            repo = rawRepoEnv.slice(0, hashIndex).trim() || DEFAULT_TEMPLATE_REPO;
+            inlineRef = rawRepoEnv.slice(hashIndex + 1).trim() || undefined;
+        }
+        else {
+            repo = rawRepoEnv;
+        }
+    }
+    const envRef = env.VEIL_TEMPLATE_REF?.trim() || undefined;
+    const explicitRef = cliRef?.trim() || envRef || inlineRef;
+    const ref = explicitRef || pinnedTag;
+    const isOverride = Boolean(explicitRef && explicitRef !== pinnedTag) || repo !== DEFAULT_TEMPLATE_REPO;
+    return {
+        repo,
+        ref,
+        pinnedTag,
+        isOverride,
+    };
+}
+export function formatDegitSpec(source, subdir) {
+    const cleanSubdir = subdir.replace(/^\/+|\/+$/g, '');
+    return `${source.repo}/${cleanSubdir}#${source.ref}`;
+}
+export function announceTemplateSource(source, warn = console.warn) {
+    if (!source.isOverride)
+        return;
+    warn(`Using overridden template ref "${source.ref}" from ${source.repo} (${source.repo}#${source.ref}; default pinned tag is ${DEFAULT_TEMPLATE_REPO}#${source.pinnedTag}).`);
+}
+export function formatCloneError(err, source) {
+    const code = err?.code;
+    const message = err instanceof Error ? err.message : String(err);
+    if (code === 'MISSING_REF' ||
+        code === 'BAD_REF' ||
+        /could not find commit hash for/i.test(message) ||
+        /Unable to Read Remote Reference/i.test(message)) {
+        return new Error(`Template tag or ref "${source.ref}" was not found in ${source.repo}. ` +
+            `Verify that the release tag "${source.ref}" exists on GitHub, or set VEIL_TEMPLATE_REF=<branch-or-tag> to use a different ref during development.`);
+    }
+    return new Error(`Failed to fetch Veil template from ${source.repo}#${source.ref}: ${message}`);
+}
+export async function cloneSubdir(source, subdir, destDir, degitFactory = degit) {
+    const spec = formatDegitSpec(source, subdir);
+    try {
+        await degitFactory(spec, { force: true }).clone(destDir);
+    }
+    catch (err) {
+        throw formatCloneError(err, source);
+    }
 }
 function run(cmd, args, cwd) {
     return new Promise((resolve, reject) => {
@@ -56,19 +129,54 @@ function excludeSdkFromTsconfig(targetDir) {
         console.warn('Could not update tsconfig.json to exclude sdk/ — you may need to add it manually.');
     }
 }
-function parseArgs(argv) {
+export function parseArgs(argv) {
     const positionals = [];
     let template;
+    let ref;
     for (const arg of argv) {
         if (arg.startsWith('--template='))
             template = arg.slice('--template='.length);
+        else if (arg.startsWith('--ref='))
+            ref = arg.slice('--ref='.length);
         else if (!arg.startsWith('-'))
             positionals.push(arg);
     }
-    return { name: positionals[0], template };
+    return { name: positionals[0], template, ref };
+}
+export async function scaffoldProject(options, deps = {}) {
+    const log = deps.log ?? console.log;
+    const warn = deps.warn ?? console.warn;
+    const degitFactory = deps.degitFactory ?? degit;
+    const runCmd = deps.runCmd ?? run;
+    const source = resolveTemplateSource(options.env, options.cliRef, options.version);
+    const { dir, label } = TEMPLATES[options.template];
+    log(`\nScaffolding ${label} app in ./${options.name}...\n`);
+    announceTemplateSource(source, warn);
+    await cloneSubdir(source, dir, options.targetDir, degitFactory);
+    log('Fetching the Veil SDK...');
+    await cloneSubdir(source, 'sdk', path.join(options.targetDir, 'sdk'), degitFactory);
+    // Templates reference the SDK from the monorepo (file:../../sdk); once
+    // scaffolded standalone the SDK lives at ./sdk instead.
+    replaceInFile(path.join(options.targetDir, 'package.json'), 'file:../../sdk', 'file:./sdk');
+    replaceInFile(path.join(options.targetDir, 'index.html'), '../../sdk/dist/vanilla.js', './sdk/dist/vanilla.js');
+    excludeSdkFromTsconfig(options.targetDir);
+    if (!options.skipInstall) {
+        log('Installing SDK dependencies and building...');
+        await runCmd('npm', ['install'], path.join(options.targetDir, 'sdk'));
+        await runCmd('npm', ['run', 'build'], path.join(options.targetDir, 'sdk'));
+        if (fs.existsSync(path.join(options.targetDir, 'package.json'))) {
+            log('Installing app dependencies...');
+            await runCmd('npm', ['install'], options.targetDir);
+        }
+    }
+    log(`\nDone! Next steps:\n`);
+    log(`  cd ${options.name}`);
+    log(options.template === 'vanilla' ? '  npx http-server .   # or any static file server' : '  npm run dev');
+    log(`\nSee ${options.name}/README.md for environment variables (factory address, RPC URL, etc.).\n`);
+    return source;
 }
 async function main() {
-    const { name: nameArg, template: templateArg } = parseArgs(process.argv.slice(2));
+    const { name: nameArg, template: templateArg, ref: refArg } = parseArgs(process.argv.slice(2));
     let name = nameArg;
     if (!name) {
         const response = await prompts({ type: 'text', name: 'name', message: 'Project name', initial: 'my-veil-app' }, { onCancel: () => process.exit(1) });
@@ -97,29 +205,27 @@ async function main() {
         console.error(`A template choice is required. Available: ${Object.keys(TEMPLATES).join(', ')}`);
         process.exit(1);
     }
-    const { dir, label } = TEMPLATES[template];
-    console.log(`\nScaffolding ${label} app in ./${name}...\n`);
-    await degit(`${REPO}/${dir}`, { force: true }).clone(targetDir);
-    console.log('Fetching the Veil SDK...');
-    await degit(`${REPO}/sdk`, { force: true }).clone(path.join(targetDir, 'sdk'));
-    // Templates reference the SDK from the monorepo (file:../../sdk); once
-    // scaffolded standalone the SDK lives at ./sdk instead.
-    replaceInFile(path.join(targetDir, 'package.json'), 'file:../../sdk', 'file:./sdk');
-    replaceInFile(path.join(targetDir, 'index.html'), '../../sdk/dist/vanilla.js', './sdk/dist/vanilla.js');
-    excludeSdkFromTsconfig(targetDir);
-    console.log('Installing SDK dependencies and building...');
-    await run('npm', ['install'], path.join(targetDir, 'sdk'));
-    await run('npm', ['run', 'build'], path.join(targetDir, 'sdk'));
-    if (fs.existsSync(path.join(targetDir, 'package.json'))) {
-        console.log('Installing app dependencies...');
-        await run('npm', ['install'], targetDir);
-    }
-    console.log(`\nDone! Next steps:\n`);
-    console.log(`  cd ${name}`);
-    console.log(template === 'vanilla' ? '  npx http-server .   # or any static file server' : '  npm run dev');
-    console.log(`\nSee ${name}/README.md for environment variables (factory address, RPC URL, etc.).\n`);
+    await scaffoldProject({
+        name,
+        template,
+        targetDir,
+        cliRef: refArg,
+    });
 }
-main().catch(err => {
-    console.error(err instanceof Error ? err.message : err);
-    process.exit(1);
-});
+function isCliEntrypoint(argv1, metaUrl) {
+    if (!argv1)
+        return false;
+    const selfPath = fileURLToPath(metaUrl);
+    try {
+        return fs.realpathSync(argv1) === fs.realpathSync(selfPath);
+    }
+    catch {
+        return path.resolve(argv1) === path.resolve(selfPath);
+    }
+}
+if (isCliEntrypoint(process.argv[1], import.meta.url)) {
+    main().catch(err => {
+        console.error(err instanceof Error ? err.message : err);
+        process.exit(1);
+    });
+}
